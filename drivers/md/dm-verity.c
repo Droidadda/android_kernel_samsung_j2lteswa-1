@@ -28,6 +28,21 @@
 
 #define DM_VERITY_MAX_LEVELS		63
 
+#define VERIFY_META_ONLY
+
+#ifdef VERIFY_META_ONLY
+extern struct rb_root *ext4_system_zone_root(struct super_block *sb);
+
+struct rb_root *system_blks;
+
+struct ext4_system_zone {
+    struct rb_node  node;
+    unsigned long long  start_blk;
+    unsigned int    count;
+};
+int start_meta;
+#endif
+
 static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
 
 module_param_named(prefetch_cluster, dm_verity_prefetch_cluster, uint, S_IRUGO | S_IWUSR);
@@ -379,9 +394,11 @@ test_block_hash:
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("data block %llu is corrupted",
 				(unsigned long long)(io->block + b));
+			if (io->block != 0) {
 			v->hash_failed = 1;
 			return -EIO;
 		}
+	}
 	}
 	BUG_ON(vector != io->io_vec_size);
 	BUG_ON(offset);
@@ -483,6 +500,26 @@ static void verity_submit_prefetch(struct dm_verity *v, struct dm_verity_io *io)
 	queue_work(v->verify_wq, &pw->work);
 }
 
+#ifdef VERIFY_META_ONLY
+static bool is_metablock(unsigned long long n_block)
+{
+    struct rb_node *node;
+    struct ext4_system_zone *entry;
+    bool result = false;
+
+    node = rb_first(system_blks);
+    while (node) {
+        entry = rb_entry(node, struct ext4_system_zone, node);
+        if (n_block >= entry->start_blk && n_block <= entry->start_blk + entry->count - 1 ) {
+            result = true;
+            return result;
+        }
+        node = rb_next(node);
+    }
+    return result;
+}
+#endif
+
 /*
  * Bio map function. It allocates dm_verity_io structure and bio vector and
  * fills them. Then it issues prefetches and the I/O.
@@ -491,7 +528,13 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 {
 	struct dm_verity *v = ti->private;
 	struct dm_verity_io *io;
-
+#ifdef VERIFY_META_ONLY
+	if (!start_meta && bio->bi_bdev->bd_super) {
+		system_blks = ext4_system_zone_root(bio->bi_bdev->bd_super);
+		DMERR_LIMIT("Successfully Get the system block information");
+		start_meta = 1;
+	}
+#endif
 	bio->bi_bdev = v->data_dev->bdev;
 	bio->bi_sector = verity_map_sector(v, bio->bi_sector);
 
@@ -509,6 +552,11 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 
 	if (bio_data_dir(bio) == WRITE)
 		return -EIO;
+
+#ifdef VERIFY_META_ONLY
+	if (start_meta && !is_metablock(bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT)))
+		goto skip_verity;
+#endif
 
 	io = dm_per_bio_data(bio, ti->per_bio_data_size);
 	io->v = v;
@@ -528,7 +576,9 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 	       io->io_vec_size * sizeof(struct bio_vec));
 
 	verity_submit_prefetch(v, io);
-
+#ifdef VERIFY_META_ONLY
+skip_verity:
+#endif
 	generic_make_request(bio);
 
 	return DM_MAPIO_SUBMITTED;
@@ -696,7 +746,7 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	if (sscanf(argv[0], "%d%c", &num, &dummy) != 1 ||
-	    num < 0 || num > 1) {
+	    num > 1) {
 		ti->error = "Invalid version";
 		r = -EINVAL;
 		goto bad;
